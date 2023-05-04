@@ -1,0 +1,274 @@
+
+name: "Deploy"
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      environment:
+        type: string
+        description: environment
+      organisation: 
+        type: string
+        description: The organisation
+      notify_teams:
+        type: string
+        description: The teams url
+      version:
+        required: true
+        type: string
+        description: 'tag'
+        default: "latest"
+      deploy-type:
+        type: string
+        description: 'Type of deploy'
+        required: true
+        default: schema-changes
+      aks_branch:
+        type: string
+        description: AKS branch
+      notify_slack_webhook:
+        type: string
+        description: The slack webhook
+      notify_slack_channel:
+        type: string
+        description: The slack channel
+      notify_slack_failure:
+        type: string
+        description: The salck url
+    secrets:
+      KUBECONFIG:
+        required: true
+      GIT_CHECKOUT_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    concurrency:
+      group: ${{ github.ref }}-${{inputs.environment}}
+      cancel-in-progress: false
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.app_url }}
+    steps:
+
+      - name: Deploy TAG ${{inputs.version}} to ${{ inputs.environment }}
+        if: "${{ inputs.environment == 'acc' || inputs.environment == 'prd' }}"
+        uses: actions/github-script@v6
+        with:
+         script: |
+           if( "${{inputs.version}}" == "latest" ){
+             core.setFailed('cant deploy latest to ${{inputs.version}}')
+           }
+
+      - uses: actions/checkout@v3
+
+      - uses: mukunku/tag-exists-action@v1.2.0
+        id: checkTag
+        with: 
+          tag: '${{inputs.version}}'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check TAG exists 
+        uses: actions/github-script@v6
+        with:
+         script: |
+           if( "${{inputs.version}}" != "latest" && "${{steps.checkTag.outputs.exists}}" == "false" ){
+             core.setFailed('Tag ${{inputs.version}} does not exist')
+           }
+
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      # show Kubectl version, fail if kubectl does not exist.
+      - name: show kubectl version
+        continue-on-error: true
+        run: |
+          kubectl version
+
+      ## PREP  HELM CODE
+      - name: Checkout helm repo
+        uses: actions/checkout@v3
+        with:
+          repository: woutersf/drupal-helm-charts-k8s
+          path: upstream_helm
+          token: ${{ secrets.GIT_CHECKOUT_TOKEN }}
+          ref: '${{ inputs.aks_branch }}'
+
+      - name: Mv in infra helm
+        run: |
+          echo "Copy from upstream HELM into helm folder.";
+          cp -n -v upstream_helm/templates/* helm/templates;
+          rm -rf helm/etc/drupal/*.gz
+      ## END HELM INFRA CODE PULL IN
+
+
+      # Validate helm stuff to not leave a broken state.
+      - name: DRY RUN
+        run: |
+          cd helm
+          helm upgrade --dry-run --timeout 15m --install -n ${{ inputs.app_key }}-${{ inputs.environment }} -f values-${{ inputs.environment }}.yaml --set deploy.runid=${{ github.run_id }} --set image.tag=${{ inputs.version }}  --set image.version=${{ inputs.version }}  ${{ inputs.app_key }} .
+
+      # EXPORT DB
+      - name: EXPORT PRE ${{ inputs.version }} DB
+        continue-on-error: true
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp;/var/www/drupal/vendor/bin/drush sql-dump --gzip --result-file=/mnt/dumps/${{ inputs.app_key }}-pre-deploy-${{ inputs.version }}-${{ inputs.environment }}.sql"
+
+      # Disable Cron
+      - name: Disable cron
+        continue-on-error: true
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        run: |
+          kubectl patch cronjobs ${{ inputs.app_key }}-cron -n ${{ inputs.app_key }}-${{ inputs.environment }} -p '{"spec" : {"suspend" : true }}'
+
+      - name: Kill shell pod
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete pod ${{ inputs.app_key }}-drush-pod
+
+      # ingress
+      - name: Set maintenance ingress
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} get ingress ${{ inputs.app_key }} -o yaml | sed 's/varnish/maintenance/' | kubectl replace -f -
+
+      # kill the php pods
+      - name: Kill php pods
+        continue-on-error: true
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete deployment ${{ inputs.app_key }}-php-fpm
+
+      # kill the nginx pods 
+      - name: Kill nginx pods
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete deployment ${{ inputs.app_key }}-nginx
+
+      # kill the repeater pods 
+      - name: Kill repeater pods
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete deployment -l repeater=yes    
+
+      # kill the cronjobs
+      - name: Kill cronjobs
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete cronjob ${{ inputs.app_key }}-cron
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete cronjob ${{ inputs.app_key }}-dbdump
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete cronjob ${{ inputs.app_key }}-loadtest
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} delete cronjob ${{ inputs.app_key }}-cypress
+
+      # Remove configmaps (are not refreshed by default) 
+      - name: Remove configmaps
+        continue-on-error: true
+        run: |
+          kubectl delete configmap cypress-config -n ${{ inputs.app_key }}-${{ inputs.environment }}
+          kubectl delete configmap k6-loadtest -n ${{ inputs.app_key }}-${{ inputs.environment }}
+          kubectl delete configmap varnish-vcl -n ${{ inputs.app_key }}-${{ inputs.environment }}
+          kubectl delete configmap php-ini -n ${{ inputs.app_key }}-${{ inputs.environment }}
+
+      # deploy new stuff.
+      - name: Helm deploy 
+        run: |
+          cd helm
+          helm upgrade --wait --timeout 25m --install -n ${{ inputs.app_key }}-${{ inputs.environment }} -f values-${{ inputs.environment }}.yaml --set deploy.runid=${{ github.run_id }} --set image.tag=${{ inputs.version }}  --set image.version=${{ inputs.version }}  ${{ inputs.app_key }} .
+
+      # ingress
+      - name: Set maintenance ingress
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} get ingress ${{ inputs.app_key }} -o yaml | sed 's/varnish/maintenance/' | kubectl replace -f -
+
+      - name: RUN UPDATE SCRIPT
+        if: "${{ inputs.deploy-type == 'schema-deploy' }}"
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -i deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp;/var/www/drupal/bash/updates/update_k8s_${{ inputs.environment }}.sh"
+
+        # ingress
+      - name: Set functional ingress
+        continue-on-error: true
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} get ingress ${{ inputs.app_key }} -o yaml | sed 's/maintenance/varnish/' | kubectl replace -f -
+
+        #Enable Cron
+      - name: Enable Cron
+        run: |
+          kubectl patch cronjobs ${{ inputs.app_key }}-cron -n ${{ inputs.app_key }}-${{ inputs.environment }} -p '{"spec" : {"suspend" : false }}'
+  
+        #Enable SB Cron
+      - name: Enable Cron (SB consumer)
+        continue-on-error: true
+        run: |
+          kubectl patch cronjobs ${{ inputs.app_key }}-consume-cron -n ${{ inputs.app_key }}-${{ inputs.environment }} -p '{"spec" : {"suspend" : false }}'
+
+      # - name: Check http status code
+      #   uses: lakuapik/gh-actions-http-status@v1
+      #   with:
+      #     sites: '["${{ inputs.app_url }}", "${{ inputs.app_url }}health"]'
+      #     expected: '[200, 200]'
+
+      - name: Slack Notification success
+        if: success()
+        continue-on-error: true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_green_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🟢 [${{ inputs.app_key }}] ${{ inputs.version }} deployed to ${{ inputs.environment }} (${{ inputs.deploy-type }})🚀"
+
+      - name: Inform via teams succeeded
+        if: success()
+        continue-on-error: true
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ inputs.app_key }}] ${{ inputs.version }} deployed to ${{ inputs.environment }}(${{ inputs.deploy-type }})"
+          BODY: Deploy succeeded
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+
+      - name: Slack Notification failure
+        if: failure()
+        continue-on-error: true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_red_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🔴 [${{ inputs.app_key }}] ${{ inputs.version }} deploy to ${{ inputs.environment }} FAILED (${{ inputs.deploy-type }})🚀"
+
+      - name: Inform via teams failed
+        if: failure()
+        continue-on-error: true
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ inputs.app_key }}] ${{ inputs.version }} deploy to ${{ inputs.environment }} FAILED (${{ inputs.deploy-type }})"
+          BODY: Deploy failed
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+
+      - uses: colpal/actions-clean@v1
+        continue-on-error: true
+        if: ${{ always() }} 

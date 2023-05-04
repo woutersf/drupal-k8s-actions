@@ -1,0 +1,204 @@
+name: "Run cypress tests"
+
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      environment:
+        type: string
+        description: environment
+      notify_teams:
+        type: string
+        description: The teams url
+      notify_slack_webhook:
+        type: string
+        description: The slack webhook
+      notify_slack_channel:
+        type: string
+        description: The slack channel
+      notify_slack_failure:
+        type: string
+        description: The slack url
+    secrets:
+      KUBECONFIG:
+        required: true
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key = ${{ inputs.app_key }}"
+          echo "environment = ${{ inputs.environment }}"
+          echo "notify_teams = ${{ inputs.notify_teams }}"
+  run-cypress-tests:
+    concurrency:
+      group: ${{ github.ref }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    runs-on: [self-hosted, k8s]
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      - name: get TIMESTAMP
+        run: echo FOO=$(date +%s) >> $GITHUB_ENV
+
+      - name: create cypress tmp folder
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -i deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "mkdir -p /tmp/drupal/cypress && mkdir -p /tmp/drupal/cypress/screenshots"
+
+      - name: empty screenshots folder
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -i deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "rm -rf /tmp/drupal/cypress/screenshots/*"
+
+      - name: Execute Cypress test on ${{ inputs.environment }}
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} create job --from=cronjob.batch/${{ inputs.app_key }}-cypress ${{ inputs.app_key }}-cypress-manual-${{ env.FOO }}
+
+      # This is neede because the resource is not immediately created
+      # and kubectl can not wait for resources that dont exist.
+      - name: Wait for job creation.
+        run: sleep 120s
+        shell: bash
+
+      # Fetch job output (after ingress to minimise downtime)
+      - name: Cypress test output [HERE IS THE REPORT]
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} logs job/${{ inputs.app_key }}-cypress-manual-${{ env.FOO }} --follow
+      # --pod-running-timeout=20s
+
+      - name: Wait for job end.
+        run: sleep 10s
+        shell: bash
+
+      - id: tests
+        name: save Pod output in Variable
+        uses: mathiasvr/command-output@v1
+        continue-on-error: true
+        with:
+          run: |
+            kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} get pods --selector=job-name=${{ inputs.app_key }}-cypress-manual-${{ env.FOO }} --no-headers -o custom-columns=":status.phase"
+
+      - name: tests-output
+        run: |
+          echo ${{ steps.tests.outputs.stdout }}
+
+      - name: tests-succeeded
+        if: ${{ contains(steps.tests.outputs.stdout, 'Succeeded') }}
+        run: |
+          echo "tests Succeeded status: ${{ steps.get-pod-output.outputs.stdout }}"         
+
+      - name: Show contents in drush pod.
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -i deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "mkdir -p /tmp/drupal/cypress/screenshots; ls -alsh /tmp/drupal/cypress/screenshots/*"
+
+      - name: make screenshot folder
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+          mkdir ${{ github.workspace }}/cypress-files
+
+      # TAR 
+      - name: EXPORT screenshots files to zip file
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp; cd /tmp/drupal/cypress/ && tar cvzf /tmp/files-${{ github.run_id }}.tar.gz screenshots"
+
+      - name: Get Drush Pod name
+        run: | 
+          echo "POD_NAME=$(kubectl get pods -n ${{ inputs.app_key }}-${{ inputs.environment }} --selector=app=${{ inputs.app_key }}-drush-pod -o jsonpath='{.items[*].metadata.name}')" >> $GITHUB_ENV;
+
+      # COPY TAR TO WORKSPACE
+      - name: COPY SCREENSHOTS FROM ${{ inputs.environment }} TO WORKSPACE
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+          kubectl cp -n ${{ inputs.app_key }}-${{ inputs.environment }} ${{ inputs.app_key }}-${{ inputs.environment }}/$POD_NAME:/tmp/files-${{ github.run_id }}.tar.gz ${{ github.workspace }}/files-${{ github.run_id }}.tar.gz
+
+      # UNZIP
+      - name: UNZIP tarball
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+           tar -xf ${{ github.workspace }}/files-${{ github.run_id }}.tar.gz -C ${{ github.workspace }}/cypress-files
+
+      - name: Show screenshots
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        run: |
+          ls  ${{ github.workspace }}/cypress-files
+
+      - name: Archive artifact
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: Cypress-Screenshots
+          retention-days: 3
+          path: |
+            cypress-files/**
+
+      - name: Slack Success Notification
+        if: ${{ contains(steps.tests.outputs.stdout, 'Succeeded') }}
+        continue-on-error: true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions 
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_green_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🧪 [${{ github.event.repository.name }}] 🟢 Your Cypress test ran without failures (${{ inputs.environment }})"
+
+      - name: Inform via teams success
+        if: ${{ contains(steps.tests.outputs.stdout, 'Succeeded') || success()}}
+        continue-on-error: true
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] 🟢 Cypress test ran without failures (${{ inputs.environment }})"
+          BODY: Tests ran succesfully
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+
+      - name: Slack Failed Notification
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') || failure() }}
+        continue-on-error: true
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_red_circle:"
+          SLACK_COLOR: '#F00909'
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🧪 [${{ github.event.repository.name }}] 🔴🔴 Your Cypress test ran and failed (${{ inputs.environment }})"
+
+      - name: Inform via teams failed
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') || failure() }}
+        continue-on-error: true
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] 🔴🔴 Your Cypress test ran and failed (${{ inputs.environment }})"
+          BODY: Tests failed
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+
+      - name: test-failed-fail-workflow
+        if: ${{ contains(steps.tests.outputs.stdout, 'Failed') }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.setFailed('Tests failed')
+
+      - uses: colpal/actions-clean@v1
+        if: ${{ always() }}

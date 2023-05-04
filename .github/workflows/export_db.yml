@@ -1,0 +1,99 @@
+name: " Export database"
+
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      environment:
+        type: string
+        description: environment
+      notify_teams:
+        type: string
+        description: The teams url
+      notify_slack_webhook:
+        type: string
+        description: The slack webhook
+      notify_slack_channel:
+        type: string
+        description: The slack channel
+        
+    secrets:
+      KUBECONFIG:
+        required: true
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key = ${{ inputs.app_key }}"
+          echo "environment = ${{ inputs.environment }}"
+          echo "notify_teams = ${{ inputs.notify_teams }}"
+
+  dump-export:
+    concurrency: 
+      group: ${{ github.ref }}-export
+      cancel-in-progress: false
+    # needs: [dump-from, dump-to]
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.environment }}
+
+    steps:
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      # EXPORT SOURCE DATA TO FILE
+      - name: EXPORT ${{ inputs.environment }} DB
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{ inputs.environment }} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp;/var/www/drupal/vendor/bin/drush sql-dump --gzip --result-file=/tmp/${{ inputs.app_key }}-${{ inputs.environment }}-${{ github.run_id }}.sql"
+
+      - name: Get Pod name
+        run: | 
+          echo "POD_NAME=$(kubectl get pods -n ${{ inputs.app_key }}-${{ inputs.environment }} --selector=app=${{ inputs.app_key }}-drush-pod -o jsonpath='{.items[*].metadata.name}')" >> $GITHUB_ENV;
+
+      # COPY FILE TO WORKSPACE
+      - name: COPY DATABASE FILE FROM ${{ inputs.environment }} TO WORKSPACE
+        shell: bash 
+        run: |
+         kubectl cp -n ${{ inputs.app_key }}-${{ inputs.environment }} ${{ inputs.app_key }}-${{ inputs.environment }}/$POD_NAME:/tmp/${{ inputs.app_key }}-${{ inputs.environment }}-${{ github.run_id }}.sql.gz ${{ github.workspace }}/${{ inputs.app_key }}-${{ inputs.environment }}-${{ github.run_id }}.sql.gz
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.app_key }}-${{ inputs.environment }}-${{ github.run_id }}.sql.gz
+          retention-days: 1
+          path: |
+            ${{ inputs.app_key }}-${{ inputs.environment }}-${{ github.run_id }}.sql.gz
+            #!dist/**/*.md
+
+      - name: Slack Notification
+        if: ${{ always() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_green_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🗑 [${{ github.event.repository.name }}] Your Dump is ready 🍲"
+
+      - name: Inform via teams succeeded
+        if: ${{ always() }}
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] Your DB Dump is ready"
+          BODY: Database Dump for ${{ github.event.inputs.thecommand }} ${{ inputs.environment }} ended
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}

@@ -1,0 +1,189 @@
+name: "C06B Sync Files"
+
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      notify_teams:
+        type: string
+        description: The teams url
+      from:
+        type: string
+        description: The from DB
+      to:
+        type: string
+        description: The target DB
+      notify_slack_webhook:
+        type: string
+        description: The slack webhook
+      notify_slack_channel:
+        type: string
+        description: The slack channel
+    secrets:
+      KUBECONFIG:
+        required: true
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key = ${{ inputs.app_key }}"
+          echo "from = ${{ inputs.from }}"
+          echo "to = ${{ inputs.to }}"
+          echo "notify_teams = ${{ inputs.notify_teams }}"
+          
+  validation: 
+    if: ${{ inputs.confirmation == 'SYNC' && github.event.inputs.to != github.event.inputs.from }}
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.from }}
+    steps:
+      - name: Copy Files from ${{ inputs.from }} to  ${{ inputs.to }}
+        run: |
+          echo "Copy Files from ${{ inputs.from }} to  ${{ inputs.to }}"
+
+  
+  take-from:
+    concurrency: 
+      group: ${{ github.ref }}-files
+      cancel-in-progress: false
+    needs: [validation]
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.from }}
+
+    steps:
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+
+      - name: Get Drush Pod name
+        run: |
+          echo "POD_NAME=$(kubectl get pods -n ${{ inputs.app_key }}-${{ inputs.from }} --selector=app=${{ inputs.app_key }}-drush-pod -o jsonpath='{.items[*].metadata.name}')" >> $GITHUB_ENV;
+
+      # EXPORT SOURCE FILES
+      - name: EXPORT ${{ inputs.from }} files to zip file
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{inputs.from}} -it $POD_NAME -- /bin/bash -c "export TEMP=/var/tmp; cd /var/www/drupal/docroot/sites/default && tar cvzf /tmp/files-${{ github.run_id }}.tar.gz files"
+
+      # COPY FILE TO WORKSPACE
+      - name: COPY ZIP FILE FROM ${{ inputs.from }} TO WORKSPACE
+        run: |
+         kubectl cp -n ${{ inputs.app_key }}-${{inputs.from}} ${{ inputs.app_key }}-${{inputs.from}}/$POD_NAME:/tmp/files-${{ github.run_id }}.tar.gz ${{ github.workspace }}/files-${{ github.run_id }}.tar.gz
+
+      # Archive zip
+      - name: Archive artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: files-${{ github.run_id }}.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            ${{ github.workspace }}/files-${{ github.run_id }}.tar.gz
+
+  put-to:
+    concurrency: 
+      group: ${{ github.ref }}-files
+      cancel-in-progress: false
+    needs: [take-from]
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.to }}
+    steps:
+      
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      # Fetch Dump from artifact storage
+      - uses: actions/download-artifact@v3
+        with:
+          name: files-${{ github.run_id }}.tar.gz
+
+      - name: Get Drush Pod name
+        run: |
+          echo "POD_NAME=$(kubectl get pods -n ${{ inputs.app_key }}-${{ inputs.to }} --selector=app=${{ inputs.app_key }}-drush-pod -o jsonpath='{.items[*].metadata.name}')" >> $GITHUB_ENV;
+
+      # COPY FILE TO DEST POD    
+      - name: COPY DATABASE FILE FROM WORKSPACE TO ${{ inputs.to }}
+        run: |
+         kubectl cp -n ${{ inputs.app_key }}-${{inputs.to}} ${{ github.workspace }}/files-${{ github.run_id }}.tar.gz ${{ inputs.app_key }}-${{inputs.to}}/$POD_NAME:/tmp/files-${{ github.run_id }}.tar.gz
+
+      # EMPTY target folder
+      - name: Delete Target Assets
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{inputs.to}} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp; cd /var/www/drupal/docroot/sites/default/files && rm -rf ./*"
+
+      # UNZIP
+      - name: UNZIP tarball
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{inputs.to}} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "export TEMP=/var/tmp;cd /tmp && tar -xf /tmp/files-${{ github.run_id }}.tar.gz -C /var/www/drupal/docroot/sites/default"  
+
+      # DELETE DESTINATION export FILE
+      - name: delete transfer file ${{ inputs.from }}
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{inputs.to}} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "rm /tmp/*.tar.gz"
+
+  cleanup-source:
+    needs: [put-to]
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.from }}
+
+    steps:
+
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      # DELETE SOURCE export FILE
+      - name: delete transfer file ${{ inputs.to }}
+        run: |
+          kubectl exec -n ${{ inputs.app_key }}-${{inputs.from}} -it deploy/${{ inputs.app_key }}-drush-pod -- /bin/bash -c "rm /tmp/*.tar.gz"
+      
+  cleanup:
+    needs: [cleanup-source]
+    runs-on: [self-hosted, k8s]
+    steps: 
+
+      # Delete artifact
+      - uses: geekyeggo/delete-artifact@v2
+        with:
+          name: |
+              files-${{ github.run_id }}.tar.gz
+
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_green_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "🗄 [${{ github.event.repository.name }}] 📑 File Sync job done from ${{inputs.from}} to ${{inputs.to}}"
+
+      - name: Inform via teams succeeded
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] File Sync job done"
+          BODY: File sync  ${{ github.event.inputs.thecommand }} from ${{ inputs.from }} to ${{ inputs.to }} ended
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+          
+      - uses: AutoModality/action-clean@v1

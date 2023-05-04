@@ -1,0 +1,64 @@
+name: "Loadtest"
+
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      environment:
+        type: string
+        description: environment
+      notify_teams:
+        type: string
+        description: The teams url
+    secrets:
+      KUBECONFIG:
+        required: true
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key = ${{ inputs.app_key }}"
+          echo "environment = ${{ inputs.environment }}"
+          echo "notify_teams = ${{ inputs.notify_teams }}"
+
+  execute-load-test:
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.app_url }}
+
+    steps:
+
+      - uses: AutoModality/action-clean@v1
+
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      - name: get TIMESTAMP
+        run: echo FOO=$(date +%s) >> $GITHUB_ENV
+
+      - name: Execute Loadtest on ${{ inputs.environment }}
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} create job --from=cronjob.batch/${{ inputs.app_key }}-loadtest ${{ inputs.app_key }}-loadtest-manual-${{ env.FOO }} 
+
+      - uses: colpal/actions-clean@v1
+        if: ${{ always() }}
+          
+      - name: Inform via teams succeeded
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] Your DB Dump is ready"
+          BODY: Loadtest ${{ inputs.environment }} triggered
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}

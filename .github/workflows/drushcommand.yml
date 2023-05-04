@@ -1,0 +1,83 @@
+name: "Drush command"
+
+on:
+  workflow_call:
+    inputs:
+      app_url:
+        type: string
+        description: Application url
+      app_key:
+        type: string
+        description: Application key
+      environment:
+        type: string
+        description: environment
+      thecommand:
+        type: string
+        description: The drush command
+      notify_teams:
+        type: string
+        description: The teams url
+      notify_slack_webhook:
+        type: string
+        description: The slack webhook
+      notify_slack_channel:
+        type: string
+        description: The slack channel
+
+    secrets:
+      KUBECONFIG:
+        required: true
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key = ${{ inputs.app_key }}"
+          echo "environment = ${{ inputs.environment }}"
+          echo "thecommand = ${{ inputs.thecommand }}"
+          echo "notify_teams = ${{ inputs.notify_teams }}"
+
+  execute-drush-command:
+    runs-on: [self-hosted, k8s]
+    environment: 
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.app_url }}
+    steps:
+      - uses: AutoModality/action-clean@v1
+      - uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+        id: setcontext
+
+      - name: Execute drush ${{ github.event.inputs.thecommand }} on ${{ inputs.environment }}
+        run: |
+          kubectl -n ${{ inputs.app_key }}-${{ inputs.environment }} exec deploy/${{ inputs.app_key }}-drush-pod -i -- /bin/bash -c "export DRUSH_OPTIONS_URI=${{ inputs.app_url }};../vendor/bin/drush ${{ github.event.inputs.thecommand }}"
+
+      - name: Slack Notification
+        if: ${{ always() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ inputs.notify_slack_webhook }}
+          SLACK_CHANNEL: ${{ inputs.notify_slack_channel }}
+          SLACK_USERNAME: Github Actions
+          SLACK_MSG_AUTHOR: ${{ github.actor }}
+          SLACK_ICON_EMOJI: ":large_green_circle:"
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_FOOTER: "OUTPUT: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SLACK_TITLE: "👩‍🔬 [${{ github.event.repository.name }}] Drush command finished"
+
+      - name: Inform via teams succeeded
+        if: ${{ always() }}
+        uses: FTsbrown/msteams-action@master
+        with: 
+          TITLE: "[${{ github.event.repository.name }}] Drush command finished"
+          BODY: Drush command ${{ github.event.inputs.thecommand }} ended
+          MS_TEAMS_WEBHOOK: ${{ inputs.notify_teams }}
+
+      - uses: colpal/actions-clean@v1
+        if: ${{ always() }} # To ensure this step runs even when earlier steps fail

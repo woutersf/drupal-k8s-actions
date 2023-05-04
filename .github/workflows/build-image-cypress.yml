@@ -1,0 +1,64 @@
+name: "Cypress"
+
+on:
+  workflow_call:
+    inputs:
+      container-tag:
+        required: true
+        type: string
+        description: 'Container tag'
+        default: "latest"
+      organisation: 
+        type: string
+        description: The organisation
+      app_url:
+        type: string
+        description: Application url
+      app_key_container:
+        type: string
+        description: Application key container
+
+    secrets:
+      KUBECONFIG:
+        required: true
+      GIT_CHECKOUT_TOKEN:
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  debug: 
+    runs-on: [self-hosted, k8s]
+    steps:
+      - name: "Show Parameters used" 
+        run: |
+          echo "container-tag = ${{ inputs.container-tag }}"
+          echo "app_url = ${{ inputs.app_url }}"
+          echo "app_key_container = ${{ inputs.app_key_container }}"
+
+  cypress-image-build:
+
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+
+      -
+        name: Log in to the Container registry
+        uses: docker/login-action@v2.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      -
+        name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/cypress/Dockerfile
+          push: true
+          tags: ghcr.io/${{ inputs.organisation }}/${{ inputs.app_key_container }}:${{ inputs.container-tag }}
